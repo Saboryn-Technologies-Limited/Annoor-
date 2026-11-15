@@ -1,53 +1,46 @@
-// Supabase Edge Function: verify-payment
-// Asks Paystack whether a payment really succeeded, then marks it PAID in the database.
+// Supabase Edge Function: paystack-webhook
+// Paystack calls this by itself after a payment, so a parent who closes the browser
+// right after paying is still marked PAID. Turn "Verify JWT" OFF for this function.
 import { createClient } from 'npm:@supabase/supabase-js@2';
 
-const cors = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+const readKey = (newName: string, legacyName: string) => {
+  try {
+    const j = JSON.parse(Deno.env.get(newName) ?? '{}');
+    if (j.default) return j.default;
+  } catch (_e) { /* fall back to the legacy key below */ }
+  return Deno.env.get(legacyName) ?? '';
 };
-const json = (b: unknown) =>
-  new Response(JSON.stringify(b), { headers: { ...cors, 'Content-Type': 'application/json' } });
+
+const hex = (b: ArrayBuffer) =>
+  [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
 
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
+  if (req.method !== 'POST') return new Response('ok');
+  const raw = await req.text();
+
+  // Only accept messages really signed by Paystack with our secret key.
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(Deno.env.get('PAYSTACK_SECRET_KEY') ?? ''),
+    { name: 'HMAC', hash: 'SHA-512' }, false, ['sign'],
+  );
+  const sig = hex(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(raw)));
+  if (sig !== req.headers.get('x-paystack-signature')) {
+    return new Response('invalid signature', { status: 401 });
+  }
+
   try {
-    const url = Deno.env.get('SUPABASE_URL')!;
-    const asUser = createClient(url, Deno.env.get('SUPABASE_ANON_KEY')!, {
-      global: { headers: { Authorization: req.headers.get('Authorization') ?? '' } },
-    });
-    const { data: { user } } = await asUser.auth.getUser();
-    if (!user) return json({ error: 'Please log in again.' });
-
-    const { reference } = await req.json();
-    if (!reference || typeof reference !== 'string') return json({ error: 'Missing reference.' });
-
-    const admin = createClient(url, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
-    // Only the parent's own payment can be checked.
-    const { data: pay } = await admin.from('payments').select('*')
-      .eq('reference', reference).eq('user_id', user.id).maybeSingle();
-    if (!pay) return json({ status: 'FAILED' });
-    if (pay.status === 'PAID') return json({ status: 'PAID' });
-
-    const r = await fetch('https://api.paystack.co/transaction/verify/' + encodeURIComponent(reference), {
-      headers: { Authorization: 'Bearer ' + Deno.env.get('PAYSTACK_SECRET_KEY') },
-    });
-    const p = await r.json();
-    if (!p.status) return json({ status: pay.status }); // could not confirm right now
-
-    const d = p.data;
-    // Paid only if Paystack says success AND the amount and currency match what we asked for.
-    if (d.status === 'success' && d.amount === pay.amount_kobo && d.currency === 'NGN') {
-      await admin.from('payments').update({ status: 'PAID' }).eq('id', pay.id);
-      return json({ status: 'PAID' });
+    const ev = JSON.parse(raw);
+    if (ev.event === 'charge.success') {
+      const d = ev.data;
+      const admin = createClient(Deno.env.get('SUPABASE_URL') ?? '', readKey('SUPABASE_SECRET_KEYS', 'SUPABASE_SERVICE_ROLE_KEY'));
+      const { data: pay } = await admin.from('payments').select('*').eq('reference', d.reference).maybeSingle();
+      if (pay && pay.status !== 'PAID' && d.status === 'success'
+          && d.amount === pay.amount_kobo && d.currency === 'NGN') {
+        await admin.from('payments').update({ status: 'PAID' }).eq('id', pay.id);
+      }
     }
-    if (d.status === 'failed') {
-      await admin.from('payments').update({ status: 'FAILED' }).eq('id', pay.id);
-      return json({ status: 'FAILED' });
-    }
-    return json({ status: 'PENDING' });
   } catch (e) {
     console.error(e);
-    return json({ error: 'Something went wrong. Please try again.' });
   }
+  return new Response('ok'); // always answer 200 so Paystack does not keep retrying
 });
